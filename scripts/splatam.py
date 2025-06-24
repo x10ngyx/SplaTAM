@@ -34,6 +34,8 @@ from utils.slam_helpers import (
 )
 from utils.slam_external import calc_ssim, build_rotation, prune_gaussians, densify
 
+from utils.tile_mask_utils import generate_pixel_mask
+
 from diff_gaussian_rasterization import GaussianRasterizer as Renderer
 
 
@@ -213,7 +215,8 @@ def initialize_first_timestep(dataset, num_frames, scene_radius_depth_ratio,
 
 def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_for_loss,
              sil_thres, use_l1, ignore_outlier_depth_loss, tracking=False, 
-             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None):
+             mapping=False, do_ba=False, plot_dir=None, visualize_tracking_loss=False, tracking_iteration=None,
+             use_pixel_sampling=False, tile_size=None, sparse_fn=None, reduce_fn=None):
     # Initialize Loss Dictionary
     losses = {}
 
@@ -271,6 +274,16 @@ def get_loss(params, curr_data, variables, iter_time_idx, loss_weights, use_sil_
     if tracking and use_sil_for_loss:
         mask = mask & presence_sil_mask
 
+    # downsample mask
+    if tracking and use_pixel_sampling:
+        downsample_mask = generate_pixel_mask(
+            curr_data['im'],             # 输入图像
+            tile_size=tile_size,         # 网格大小
+            sparse_fn=sparse_fn,         # 采样策略
+            reduce_fn=reduce_fn,         # 减少策略
+        )
+        mask = mask & downsample_mask
+    
     # Depth loss
     if use_l1:
         mask = mask.detach()
@@ -694,7 +707,11 @@ def rgbd_slam(config: dict):
                                                    config['tracking']['use_sil_for_loss'], config['tracking']['sil_thres'],
                                                    config['tracking']['use_l1'], config['tracking']['ignore_outlier_depth_loss'], tracking=True, 
                                                    plot_dir=eval_dir, visualize_tracking_loss=config['tracking']['visualize_tracking_loss'],
-                                                   tracking_iteration=iter)
+                                                   tracking_iteration=iter,
+                                                   use_pixel_sampling=config['tracking']['use_pixel_sampling'],
+                                                   tile_size=config['tracking']['tile_size'],
+                                                   sparse_fn=config['tracking']['sparse_fn'],
+                                                   reduce_fn=config['tracking']['reduce_fn'])
                 if config['use_wandb']:
                     # Report Loss
                     wandb_tracking_step = report_loss(losses, wandb_run, wandb_tracking_step, tracking=True)
@@ -994,12 +1011,34 @@ if __name__ == "__main__":
 
     parser.add_argument("experiment", type=str, help="Path to experiment file")
 
+  
+    parser.add_argument("--use_sampling", action="store_true", help="Whether to use pixel sampling")
+    parser.add_argument("--tile_size", type=int, default=32, help="Tile size for sampling")
+    parser.add_argument("--sparse_fn", type=str, default="random", 
+                        choices=["uniform", "random", "harris", "fast", "dog", "goodFeatures", "orb"],
+                        help="Sampling strategy")
+    parser.add_argument("--reduce_fn", type=str, default="normal", 
+                        choices=["normal", "sort"],
+                        help="Reduction strategy")
+    
     args = parser.parse_args()
 
     experiment = SourceFileLoader(
         os.path.basename(args.experiment), args.experiment
     ).load_module()
 
+    if args.use_sampling:
+        experiment.config['run_name'] += f"tile{args.tile_size}_{args.sparse_fn}"
+        experiment.config['tracking']['use_pixel_sampling'] = True
+        
+    else:
+        experiment.config['run_name'] += "baseline"
+        experiment.config['tracking']['use_pixel_sampling'] = False
+
+    experiment.config['tracking']['tile_size'] = (args.tile_size, args.tile_size)
+    experiment.config['tracking']['sparse_fn'] = args.sparse_fn
+    experiment.config['tracking']['reduce_fn'] = args.reduce_fn
+        
     # Set Experiment Seed
     seed_everything(seed=experiment.config['seed'])
     
@@ -1011,4 +1050,12 @@ if __name__ == "__main__":
         os.makedirs(results_dir, exist_ok=True)
         shutil.copy(args.experiment, os.path.join(results_dir, "config.py"))
 
+    print("-" * 50)
+    print(f"Running Experiment: {experiment.config['run_name']}")
+    print(f"Using Sampling: {experiment.config['tracking']['use_pixel_sampling']}")
+    print(f"Tile Size: {experiment.config['tracking']['tile_size']}")
+    print(f"Sampling Strategy: {experiment.config['tracking']['sparse_fn']}")
+    print(f"Reduction Strategy: {experiment.config['tracking']['reduce_fn']}")
+    print("-" * 50)
+    
     rgbd_slam(experiment.config)
